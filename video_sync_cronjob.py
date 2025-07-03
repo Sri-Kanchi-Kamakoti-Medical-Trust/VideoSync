@@ -149,17 +149,27 @@ class VideoSyncManager:
     def sync_and_anonymize_video(self, source_path: Path) -> Optional[Path]:
         """Sync and anonymize a single video file, then upload to Azure Blob Storage"""
         try:
+            # Calculate relative path from source directory
+            relative_path = source_path.relative_to(self.source_dir)
+            relative_dir = relative_path.parent
+            
             # Generate anonymous filename
             anonymous_filename = self.generate_anonymous_name(source_path.name)
-            destination_path = self.destination_dir / anonymous_filename
+            
+            # Create destination path maintaining folder structure
+            destination_dir = self.destination_dir / relative_dir
+            destination_path = destination_dir / anonymous_filename
+            
+            # Ensure destination subdirectory exists
+            destination_dir.mkdir(parents=True, exist_ok=True)
             
             # Check if file already exists in destination
             if destination_path.exists():
-                logger.info(f"Anonymized file already exists: {anonymous_filename}")
+                logger.info(f"Anonymized file already exists: {relative_dir / anonymous_filename}")
                 
                 # Check if upload to Azure is needed
-                if self.azure_enabled and not self.is_blob_uploaded(anonymous_filename):
-                    upload_success = self.upload_to_azure_blob(destination_path, anonymous_filename)
+                if self.azure_enabled and not self.is_blob_uploaded(anonymous_filename, relative_dir):
+                    upload_success = self.upload_to_azure_blob(destination_path, anonymous_filename, relative_dir)
                     if upload_success:
                         # Update mapping to reflect upload status
                         if str(source_path) in self.hash_mappings:
@@ -169,13 +179,15 @@ class VideoSyncManager:
                 return destination_path
             
             # Copy file with new anonymous name
-            logger.info(f"Processing: {source_path.name} -> {anonymous_filename}")
+            logger.info(f"Processing: {relative_path} -> {relative_dir / anonymous_filename}")
             shutil.copy2(source_path, destination_path)
             
             # Update hash mappings
             mapping_data = {
                 'original_name': source_path.name,
                 'anonymous_name': anonymous_filename,
+                'relative_path': str(relative_path),
+                'relative_dir': str(relative_dir),
                 'processed_date': datetime.now().isoformat(),
                 'file_size': source_path.stat().st_size,
                 'azure_uploaded': False,
@@ -184,17 +196,17 @@ class VideoSyncManager:
             
             # Upload to Azure Blob Storage if enabled
             if self.azure_enabled:
-                upload_success = self.upload_to_azure_blob(destination_path, anonymous_filename)
+                upload_success = self.upload_to_azure_blob(destination_path, anonymous_filename, relative_dir)
                 if upload_success:
                     mapping_data['azure_uploaded'] = True
                     mapping_data['azure_upload_date'] = datetime.now().isoformat()
-                    logger.info(f"Successfully uploaded {anonymous_filename} to Azure Blob Storage")
+                    logger.info(f"Successfully uploaded {relative_dir / anonymous_filename} to Azure Blob Storage")
                 else:
-                    logger.warning(f"Failed to upload {anonymous_filename} to Azure Blob Storage")
+                    logger.warning(f"Failed to upload {relative_dir / anonymous_filename} to Azure Blob Storage")
             
             self.hash_mappings[str(source_path)] = mapping_data
             
-            logger.info(f"Successfully processed: {source_path.name}")
+            logger.info(f"Successfully processed: {relative_path}")
             return destination_path
             
         except Exception as e:
@@ -280,11 +292,18 @@ class VideoSyncManager:
         for source_path_str, mapping in list(self.hash_mappings.items()):
             source_path = Path(source_path_str)
             if not source_path.exists():
-                # Remove the anonymized file
-                anonymous_path = self.destination_dir / mapping['anonymous_name']
+                # Build the anonymized file path with folder structure
+                relative_dir = Path(mapping.get('relative_dir', '.'))
+                anonymous_filename = mapping['anonymous_name']
+                
+                if str(relative_dir) != '.':
+                    anonymous_path = self.destination_dir / relative_dir / anonymous_filename
+                else:
+                    anonymous_path = self.destination_dir / anonymous_filename
+                
                 if anonymous_path.exists():
                     anonymous_path.unlink()
-                    logger.info(f"Removed orphaned file: {mapping['anonymous_name']}")
+                    logger.info(f"Removed orphaned file: {relative_dir / anonymous_filename}")
                     orphaned_count += 1
                 
                 # Remove from mappings
@@ -334,8 +353,8 @@ class VideoSyncManager:
             logger.error(f"Failed to initialize Azure Blob Storage client: {e}")
             self.azure_enabled = False
     
-    def upload_to_azure_blob(self, file_path: Path, blob_name: str) -> bool:
-        """Upload file to Azure Blob Storage"""
+    def upload_to_azure_blob(self, file_path: Path, blob_name: str, relative_dir: Path = None) -> bool:
+        """Upload file to Azure Blob Storage maintaining folder structure"""
         if not self.azure_enabled:
             logger.warning("Azure Blob Storage not enabled, skipping upload")
             return False
@@ -343,11 +362,18 @@ class VideoSyncManager:
         try:
             azure_settings = self.config.get('azure_blob_settings', {})
             blob_prefix = azure_settings.get('blob_prefix', 'videos/')
-            full_blob_name = f"{blob_prefix}{blob_name}"
+            
+            # Build full blob path maintaining folder structure
+            if relative_dir and str(relative_dir) != '.':
+                # Convert Windows path separators to forward slashes for blob storage
+                relative_dir_str = str(relative_dir).replace('\\', '/')
+                full_blob_name = f"{blob_prefix}{relative_dir_str}/{blob_name}"
+            else:
+                full_blob_name = f"{blob_prefix}{blob_name}"
             
             logger.info(f"Uploading {file_path.name} to Azure Blob: {full_blob_name}")
             
-            # Upload file with retry logic
+            # Upload file with retry logic and custom block size
             max_retries = azure_settings.get('max_retries', 3)
             retry_delay = azure_settings.get('retry_delay', 30)
             
@@ -355,7 +381,12 @@ class VideoSyncManager:
                 try:
                     with open(file_path, 'rb') as data:
                         blob_client = self.container_client.get_blob_client(full_blob_name)
-                        blob_client.upload_blob(data, overwrite=True)
+                        blob_client.upload_blob(
+                            data, 
+                            overwrite=True,
+                            max_concurrency=4,
+                            blob_type="BlockBlob",
+                        )
                     
                     logger.info(f"Successfully uploaded {file_path.name} to Azure Blob Storage")
                     
@@ -421,7 +452,7 @@ class VideoSyncManager:
             logger.error(f"Failed to list Azure blobs: {e}")
             return []
     
-    def is_blob_uploaded(self, blob_name: str) -> bool:
+    def is_blob_uploaded(self, blob_name: str, relative_dir: Path = None) -> bool:
         """Check if blob already exists in Azure Storage"""
         if not self.azure_enabled:
             return False
@@ -429,7 +460,13 @@ class VideoSyncManager:
         try:
             azure_settings = self.config.get('azure_blob_settings', {})
             blob_prefix = azure_settings.get('blob_prefix', 'videos/')
-            full_blob_name = f"{blob_prefix}{blob_name}"
+            
+            # Build full blob path maintaining folder structure
+            if relative_dir and str(relative_dir) != '.':
+                relative_dir_str = str(relative_dir).replace('\\', '/')
+                full_blob_name = f"{blob_prefix}{relative_dir_str}/{blob_name}"
+            else:
+                full_blob_name = f"{blob_prefix}{blob_name}"
             
             blob_client = self.container_client.get_blob_client(full_blob_name)
             blob_client.get_blob_properties()
@@ -440,6 +477,7 @@ class VideoSyncManager:
         except Exception as e:
             logger.error(f"Error checking blob existence: {e}")
             return False
+        
 def main():
     """Main function for cronjob execution"""
     parser = argparse.ArgumentParser(description='Surgical Video Sync and Anonymization with Azure Blob Storage')
