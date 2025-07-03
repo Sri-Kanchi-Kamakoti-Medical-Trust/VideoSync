@@ -24,7 +24,7 @@ For a quick automated setup, you can use the provided setup script:
 
 ```powershell
 # Navigate to project directory
-cd C:\Users\b-bsachdeva\Documents\codes
+cd <project_dir>
 
 # Run the setup script
 .\setup.ps1
@@ -59,7 +59,7 @@ Using a virtual environment isolates the project dependencies and prevents confl
 #### Option A: Using venv (Built-in, Recommended)
 ```powershell
 # Navigate to your project directory
-cd C:\Users\b-bsachdeva\Documents\codes
+cd <project_dir>
 
 # Create virtual environment
 python -m venv surgical_video_env
@@ -158,7 +158,7 @@ Edit `video_sync_config.json` to customize:
 **Always activate your virtual environment first:**
 ```powershell
 # Navigate to project directory
-cd C:\Users\b-bsachdeva\Documents\codes
+cd <project_dir>
 
 # Activate virtual environment
 .\surgical_video_env\Scripts\Activate.ps1
@@ -297,7 +297,7 @@ This allows for reverse lookup if needed while maintaining anonymity and trackin
 2. **Virtual Environment Not Activating**:
    ```powershell
    # Try using the full path
-   C:\Users\b-bsachdeva\Documents\codes\surgical_video_env\Scripts\Activate.ps1
+   <project_dir>\surgical_video_env\Scripts\Activate.ps1
    
    # Or use Command Prompt instead of PowerShell
    surgical_video_env\Scripts\activate.bat
