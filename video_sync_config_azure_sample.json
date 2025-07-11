@@ -15,6 +15,15 @@
   "hash_algorithm": "sha256",
   "salt": "surgical_video_salt_2025_secure_change_this",
   
+  "case_sheet_detection": {
+    "enabled": true,
+    "threshold": 12,
+    "window_size": 15,
+    "temp_frames_dir": "./temp_frames",
+    "max_frames": 1000,
+    "_description": "Case sheet detection for video anonymization clipping"
+  },
+  
   "azure_blob_settings": {
     "enabled": true,
     "_connection_string_help": "Get this from Azure Portal > Storage Account > Access Keys",

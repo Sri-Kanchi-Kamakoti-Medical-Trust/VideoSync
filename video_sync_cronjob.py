@@ -14,8 +14,14 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import argparse
+import cv2
+import numpy as np
+from scipy.ndimage import gaussian_filter1d
+
+# Import case sheet detection functions
+from detect_case_sheet import extract_frames, compute_laplacian_variance, detect_case_sheet
 
 # Azure Blob Storage imports
 try:
@@ -84,6 +90,13 @@ class VideoSyncManager:
             "supported_formats": [".mp4", ".avi", ".mov", ".mkv"],
             "hash_algorithm": "sha256",
             "salt": "surgical_video_salt_2025",
+            "case_sheet_detection": {
+                "enabled": True,
+                "threshold": 12,
+                "window_size": 15,
+                "temp_frames_dir": "./temp_frames",
+                "max_frames": 1000
+            },
             "azure_blob_settings": {
                 "enabled": False,
                 "connection_string": "",
@@ -178,9 +191,53 @@ class VideoSyncManager:
                 
                 return destination_path
             
-            # Copy file with new anonymous name
-            logger.info(f"Processing: {relative_path} -> {relative_dir / anonymous_filename}")
-            shutil.copy2(source_path, destination_path)
+            # Case sheet detection for anonymization clipping
+            clip_start_time = None
+            case_sheet_settings = self.config.get('case_sheet_detection', {})
+            
+            if case_sheet_settings.get('enabled', True):
+                logger.info(f"Performing case sheet detection for: {source_path.name}")
+                
+                # Create temporary directory for frames
+                temp_frames_dir = Path(case_sheet_settings.get('temp_frames_dir', './temp_frames'))
+                temp_frames_dir.mkdir(parents=True, exist_ok=True)
+                
+                try:
+                    # Extract frames from video
+                    fps, saved_frames = self.extract_frames(source_path, temp_frames_dir, 
+                                                           case_sheet_settings.get('max_frames', 1000))
+                    
+                    if saved_frames > 0:
+                        # Compute Laplacian variance using imported function
+                        variances = compute_laplacian_variance(str(temp_frames_dir))
+                        
+                        # Detect case sheet using imported function
+                        window_start, window_end = detect_case_sheet(variances)
+                        
+                        if window_end is not None:
+                            clip_start_time = window_end  # Start after case sheet ends
+                            logger.info(f"Case sheet detected - will clip video from {clip_start_time} seconds")
+                        else:
+                            logger.info("No case sheet detected - no clipping needed")
+                    
+                    # Clean up temporary frames
+                    shutil.rmtree(temp_frames_dir, ignore_errors=True)
+                    
+                except Exception as e:
+                    logger.warning(f"Case sheet detection failed for {source_path.name}: {e}")
+                    # Clean up temporary frames on error
+                    shutil.rmtree(temp_frames_dir, ignore_errors=True)
+            
+            # Process video (clip if needed, otherwise copy)
+            if clip_start_time is not None:
+                logger.info(f"Clipping and processing: {relative_path} -> {relative_dir / anonymous_filename}")
+                success = self.clip_video(source_path, destination_path, clip_start_time)
+                if not success:
+                    logger.warning(f"Clipping failed for {source_path.name}, falling back to full copy")
+                    shutil.copy2(source_path, destination_path)
+            else:
+                logger.info(f"Processing: {relative_path} -> {relative_dir / anonymous_filename}")
+                shutil.copy2(source_path, destination_path)
             
             # Update hash mappings
             mapping_data = {
@@ -190,6 +247,8 @@ class VideoSyncManager:
                 'relative_dir': str(relative_dir),
                 'processed_date': datetime.now().isoformat(),
                 'file_size': source_path.stat().st_size,
+                'clipped_start_time': clip_start_time,
+                'anonymization_method': 'clipped' if clip_start_time is not None else 'copied',
                 'azure_uploaded': False,
                 'azure_upload_date': None
             }
@@ -476,6 +535,40 @@ class VideoSyncManager:
             return False
         except Exception as e:
             logger.error(f"Error checking blob existence: {e}")
+            return False
+
+    def clip_video(self, input_path: Path, output_path: Path, start_time: int) -> bool:
+        """Clip video from start_time to end for anonymization using moviepy"""
+        try:
+            from moviepy.editor import VideoFileClip
+            
+            # Load the video
+            with VideoFileClip(str(input_path)) as video:
+                # Clip from start_time to end
+                clipped_video = video.subclip(start_time)
+                
+                # Write the clipped video
+                clipped_video.write_videofile(
+                    str(output_path),
+                    codec='libx264',
+                    audio_codec='aac',
+                    temp_audiofile='temp-audio.m4a',
+                    remove_temp=True,
+                    verbose=False,
+                    logger=None
+                )
+                
+                # Clean up
+                clipped_video.close()
+            
+            logger.info(f"Successfully clipped video: {input_path.name} -> {output_path.name}")
+            return True
+                
+        except ImportError:
+            logger.error("moviepy library not installed. Install with: pip install moviepy")
+            return False
+        except Exception as e:
+            logger.error(f"Error clipping video {input_path}: {e}")
             return False
         
 def main():
