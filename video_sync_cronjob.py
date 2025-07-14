@@ -16,12 +16,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import argparse
-import cv2
-import numpy as np
-from scipy.ndimage import gaussian_filter1d
 
 # Import case sheet detection functions
-from detect_case_sheet import extract_frames, compute_laplacian_variance, detect_case_sheet
+from detect_case_sheet import compute_laplacian_variance_from_video, detect_case_sheet, clip_video
 
 # Azure Blob Storage imports
 try:
@@ -198,40 +195,31 @@ class VideoSyncManager:
             if case_sheet_settings.get('enabled', True):
                 logger.info(f"Performing case sheet detection for: {source_path.name}")
                 
-                # Create temporary directory for frames
-                temp_frames_dir = Path(case_sheet_settings.get('temp_frames_dir', './temp_frames'))
-                temp_frames_dir.mkdir(parents=True, exist_ok=True)
                 
                 try:
                     # Extract frames from video
-                    fps, saved_frames = self.extract_frames(source_path, temp_frames_dir, 
-                                                           case_sheet_settings.get('max_frames', 1000))
-                    
-                    if saved_frames > 0:
-                        # Compute Laplacian variance using imported function
-                        variances = compute_laplacian_variance(str(temp_frames_dir))
-                        
-                        # Detect case sheet using imported function
-                        window_start, window_end = detect_case_sheet(variances)
-                        
-                        if window_end is not None:
-                            clip_start_time = window_end  # Start after case sheet ends
-                            logger.info(f"Case sheet detected - will clip video from {clip_start_time} seconds")
-                        else:
-                            logger.info("No case sheet detected - no clipping needed")
-                    
-                    # Clean up temporary frames
-                    shutil.rmtree(temp_frames_dir, ignore_errors=True)
-                    
+                    variances = compute_laplacian_variance_from_video(
+                        source_path,
+                        max_frames=case_sheet_settings.get('max_frames', 1000)
+                    )
+
+                    # Detect case sheet using imported function
+                    window_start, window_end = detect_case_sheet(variances)
+
+                    if window_end is not None:
+                        clip_start_time = window_end  # Start after case sheet ends
+                        logger.info(f"Case sheet detected - will clip video from {clip_start_time} seconds")
+                    else:
+                        logger.info("No case sheet detected - no clipping needed")
+  
                 except Exception as e:
                     logger.warning(f"Case sheet detection failed for {source_path.name}: {e}")
-                    # Clean up temporary frames on error
-                    shutil.rmtree(temp_frames_dir, ignore_errors=True)
+                    
             
             # Process video (clip if needed, otherwise copy)
             if clip_start_time is not None:
                 logger.info(f"Clipping and processing: {relative_path} -> {relative_dir / anonymous_filename}")
-                success = self.clip_video(source_path, destination_path, clip_start_time)
+                success = clip_video(source_path, destination_path, clip_start_time)
                 if not success:
                     logger.warning(f"Clipping failed for {source_path.name}, falling back to full copy")
                     shutil.copy2(source_path, destination_path)
@@ -252,7 +240,6 @@ class VideoSyncManager:
                 'azure_uploaded': False,
                 'azure_upload_date': None
             }
-            
             # Upload to Azure Blob Storage if enabled
             if self.azure_enabled:
                 upload_success = self.upload_to_azure_blob(destination_path, anonymous_filename, relative_dir)
@@ -296,25 +283,8 @@ class VideoSyncManager:
             if self.is_video_processed(video_path):
                 logger.info(f"Skipping already processed file: {video_path.name}")
                 stats['skipped'] += 1
-                
-                # Check if Azure upload is needed for existing files
-                if self.azure_enabled:
-                    mapping = self.hash_mappings.get(str(video_path), {})
-                    if not mapping.get('azure_uploaded', False):
-                        anonymous_filename = mapping.get('anonymous_name')
-                        if anonymous_filename:
-                            destination_path = self.destination_dir / anonymous_filename
-                            if destination_path.exists():
-                                upload_success = self.upload_to_azure_blob(destination_path, anonymous_filename)
-                                if upload_success:
-                                    self.hash_mappings[str(video_path)]['azure_uploaded'] = True
-                                    self.hash_mappings[str(video_path)]['azure_upload_date'] = datetime.now().isoformat()
-                                    stats['azure_uploaded'] += 1
-                                else:
-                                    stats['azure_failed'] += 1
-                
                 continue
-            
+
             result = self.sync_and_anonymize_video(video_path)
             if result:
                 stats['processed'] += 1
@@ -537,39 +507,6 @@ class VideoSyncManager:
             logger.error(f"Error checking blob existence: {e}")
             return False
 
-    def clip_video(self, input_path: Path, output_path: Path, start_time: int) -> bool:
-        """Clip video from start_time to end for anonymization using moviepy"""
-        try:
-            from moviepy.editor import VideoFileClip
-            
-            # Load the video
-            with VideoFileClip(str(input_path)) as video:
-                # Clip from start_time to end
-                clipped_video = video.subclip(start_time)
-                
-                # Write the clipped video
-                clipped_video.write_videofile(
-                    str(output_path),
-                    codec='libx264',
-                    audio_codec='aac',
-                    temp_audiofile='temp-audio.m4a',
-                    remove_temp=True,
-                    verbose=False,
-                    logger=None
-                )
-                
-                # Clean up
-                clipped_video.close()
-            
-            logger.info(f"Successfully clipped video: {input_path.name} -> {output_path.name}")
-            return True
-                
-        except ImportError:
-            logger.error("moviepy library not installed. Install with: pip install moviepy")
-            return False
-        except Exception as e:
-            logger.error(f"Error clipping video {input_path}: {e}")
-            return False
         
 def main():
     """Main function for cronjob execution"""
