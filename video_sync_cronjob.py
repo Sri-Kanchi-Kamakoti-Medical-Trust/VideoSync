@@ -13,9 +13,10 @@ import logging
 import json
 import time
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Dict, List, Optional, Tuple
 import argparse
+import platform
 
 # Import case sheet detection functions
 from detect_case_sheet import compute_laplacian_variance_from_video, detect_case_sheet, clip_video
@@ -49,13 +50,13 @@ class VideoSyncManager:
     def __init__(self, config_file: str = 'video_sync_config.json'):
         """Initialize the video sync manager with configuration"""
         self.config = self.load_config(config_file)
-        self.source_dir = Path(self.config['source_directory'])
-        self.destination_dir = Path(self.config['destination_directory'])
-        self.hash_mapping_file = Path(self.config['hash_mapping_file'])
+        self.source_dir = self._normalize_path(self.config['source_directory'])
+        self.destination_dir = self._normalize_path(self.config['destination_directory'])
+        self.hash_mapping_file = self._normalize_path(self.config['hash_mapping_file'])
         self.supported_formats = self.config.get('supported_formats', ['.mp4', '.avi', '.mov', '.mkv'])
         
         # Ensure directories exist
-        self.destination_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_directory_exists(self.destination_dir)
         
         # Load existing hash mappings
         self.hash_mappings = self.load_hash_mappings()
@@ -66,6 +67,65 @@ class VideoSyncManager:
         self.azure_enabled = False
         self._initialize_azure_client()
     
+    def _normalize_path(self, path_str: str) -> Path:
+        """Normalize path string to handle UNC paths properly"""
+        if not path_str:
+            return Path('.')
+        
+        # Handle UNC paths on Windows
+        if platform.system() == 'Windows' and path_str.startswith(('\\\\', '//')):
+            # Convert forward slashes to backslashes for UNC paths
+            path_str = path_str.replace('/', '\\')
+            
+            # For UNC paths, we need to use os.path operations initially
+            # then convert to Path for consistency
+            if os.path.exists(path_str):
+                return Path(path_str)
+            else:
+                # Create Path object even if path doesn't exist yet
+                return Path(path_str)
+        
+        return Path(path_str)
+    
+    def _ensure_directory_exists(self, directory: Path) -> bool:
+        """Ensure directory exists, handling UNC paths"""
+        try:
+            if platform.system() == 'Windows' and self._is_unc_path(directory):
+                # For UNC paths, use os.makedirs which handles network paths better
+                os.makedirs(str(directory), exist_ok=True)
+            else:
+                directory.mkdir(parents=True, exist_ok=True)
+            return True
+        except (OSError, PermissionError) as e:
+            logger.error(f"Failed to create directory {directory}: {e}")
+            return False
+    
+    def _is_unc_path(self, path: Path) -> bool:
+        """Check if path is a UNC path"""
+        path_str = str(path)
+        return platform.system() == 'Windows' and path_str.startswith('\\\\')
+    
+    def _safe_path_exists(self, path: Path) -> bool:
+        """Safely check if path exists, handling network timeouts"""
+        try:
+            if self._is_unc_path(path):
+                # For UNC paths, use os.path.exists which may be more reliable
+                return os.path.exists(str(path))
+            return path.exists()
+        except (OSError, TimeoutError) as e:
+            logger.warning(f"Error checking path existence {path}: {e}")
+            return False
+    
+    def _safe_path_stat(self, path: Path) -> Optional[os.stat_result]:
+        """Safely get path stats, handling network issues"""
+        try:
+            if self._is_unc_path(path):
+                return os.stat(str(path))
+            return path.stat()
+        except (OSError, TimeoutError) as e:
+            logger.warning(f"Error getting path stats {path}: {e}")
+            return None
+
     def load_config(self, config_file: str) -> Dict:
         """Load configuration from JSON file"""
         try:
@@ -145,22 +205,57 @@ class VideoSyncManager:
         return anonymous_name
     
     def get_video_files(self, directory: Path) -> List[Path]:
-        """Get all video files from directory"""
+        """Get all video files from directory, handling UNC paths"""
         video_files = []
-        for file_path in directory.rglob('*'):
-            if file_path.is_file() and file_path.suffix.lower() in self.supported_formats:
-                video_files.append(file_path)
+        try:
+            if self._is_unc_path(directory):
+                # For UNC paths, use os.walk which may be more reliable
+                for root, dirs, files in os.walk(str(directory)):
+                    for file in files:
+                        file_path = Path(root) / file
+                        if file_path.suffix.lower() in self.supported_formats:
+                            video_files.append(file_path)
+            else:
+                for file_path in directory.rglob('*'):
+                    if file_path.is_file() and file_path.suffix.lower() in self.supported_formats:
+                        video_files.append(file_path)
+        except (OSError, PermissionError) as e:
+            logger.error(f"Error accessing directory {directory}: {e}")
+        
         return video_files
     
     def is_video_processed(self, video_path: Path) -> bool:
         """Check if video has already been processed"""
-        return str(video_path) in self.hash_mappings
+        # Normalize path for comparison
+        normalized_path = str(self._normalize_path(str(video_path)))
+        return normalized_path in self.hash_mappings
     
     def sync_and_anonymize_video(self, source_path: Path) -> Optional[Path]:
         """Sync and anonymize a single video file, then upload to Azure Blob Storage"""
         try:
+            # Normalize source path
+            source_path = self._normalize_path(str(source_path))
+            
+            # Check if source file exists
+            if not self._safe_path_exists(source_path):
+                logger.error(f"Source file does not exist: {source_path}")
+                return None
+            
             # Calculate relative path from source directory
-            relative_path = source_path.relative_to(self.source_dir)
+            try:
+                relative_path = source_path.relative_to(self.source_dir)
+            except ValueError:
+                # If relative_to fails (common with UNC paths), use alternative method
+                source_parts = Path(str(source_path)).parts
+                source_dir_parts = Path(str(self.source_dir)).parts
+                
+                # Find common prefix and create relative path
+                if len(source_parts) > len(source_dir_parts):
+                    relative_parts = source_parts[len(source_dir_parts):]
+                    relative_path = Path(*relative_parts)
+                else:
+                    relative_path = Path(source_path.name)
+            
             relative_dir = relative_path.parent
             
             # Generate anonymous filename
@@ -171,10 +266,12 @@ class VideoSyncManager:
             destination_path = destination_dir / anonymous_filename
             
             # Ensure destination subdirectory exists
-            destination_dir.mkdir(parents=True, exist_ok=True)
+            if not self._ensure_directory_exists(destination_dir):
+                logger.error(f"Failed to create destination directory: {destination_dir}")
+                return None
             
             # Check if file already exists in destination
-            if destination_path.exists():
+            if self._safe_path_exists(destination_path):
                 logger.info(f"Anonymized file already exists: {relative_dir / anonymous_filename}")
                 
                 # Check if upload to Azure is needed
@@ -182,9 +279,10 @@ class VideoSyncManager:
                     upload_success = self.upload_to_azure_blob(destination_path, anonymous_filename, relative_dir)
                     if upload_success:
                         # Update mapping to reflect upload status
-                        if str(source_path) in self.hash_mappings:
-                            self.hash_mappings[str(source_path)]['azure_uploaded'] = True
-                            self.hash_mappings[str(source_path)]['azure_upload_date'] = datetime.now().isoformat()
+                        normalized_source_path = str(source_path)
+                        if normalized_source_path in self.hash_mappings:
+                            self.hash_mappings[normalized_source_path]['azure_uploaded'] = True
+                            self.hash_mappings[normalized_source_path]['azure_upload_date'] = datetime.now().isoformat()
                 
                 return destination_path
             
@@ -194,7 +292,6 @@ class VideoSyncManager:
             
             if case_sheet_settings.get('enabled', True):
                 logger.info(f"Performing case sheet detection for: {source_path.name}")
-                
                 
                 try:
                     # Extract frames from video
@@ -222,10 +319,14 @@ class VideoSyncManager:
                 success = clip_video(source_path, destination_path, clip_start_time)
                 if not success:
                     logger.warning(f"Clipping failed for {source_path.name}, falling back to full copy")
-                    shutil.copy2(source_path, destination_path)
+                    self._safe_copy_file(source_path, destination_path)
             else:
                 logger.info(f"Processing: {relative_path} -> {relative_dir / anonymous_filename}")
-                shutil.copy2(source_path, destination_path)
+                self._safe_copy_file(source_path, destination_path)
+            
+            # Get file size safely
+            file_stat = self._safe_path_stat(source_path)
+            file_size = file_stat.st_size if file_stat else 0
             
             # Update hash mappings
             mapping_data = {
@@ -234,12 +335,13 @@ class VideoSyncManager:
                 'relative_path': str(relative_path),
                 'relative_dir': str(relative_dir),
                 'processed_date': datetime.now().isoformat(),
-                'file_size': source_path.stat().st_size,
+                'file_size': file_size,
                 'clipped_start_time': clip_start_time,
                 'anonymization_method': 'clipped' if clip_start_time is not None else 'copied',
                 'azure_uploaded': False,
                 'azure_upload_date': None
             }
+            
             # Upload to Azure Blob Storage if enabled
             if self.azure_enabled:
                 upload_success = self.upload_to_azure_blob(destination_path, anonymous_filename, relative_dir)
@@ -259,13 +361,26 @@ class VideoSyncManager:
             logger.error(f"Error processing {source_path}: {e}")
             return None
     
+    def _safe_copy_file(self, source: Path, destination: Path) -> bool:
+        """Safely copy file, handling UNC paths and network issues"""
+        try:
+            if self._is_unc_path(source) or self._is_unc_path(destination):
+                # For UNC paths, use shutil.copy2 with string paths
+                shutil.copy2(str(source), str(destination))
+            else:
+                shutil.copy2(source, destination)
+            return True
+        except (OSError, PermissionError, TimeoutError) as e:
+            logger.error(f"Error copying file from {source} to {destination}: {e}")
+            return False
+    
     def run_sync(self) -> Dict[str, int]:
         """Run the complete sync and anonymization process with Azure upload"""
         logger.info("Starting video sync and anonymization process with Azure Blob Storage")
         
         # Check if source directory exists
-        if not self.source_dir.exists():
-            logger.error(f"Source directory does not exist: {self.source_dir}")
+        if not self._safe_path_exists(self.source_dir):
+            logger.error(f"Source directory does not exist or is not accessible: {self.source_dir}")
             return {'processed': 0, 'skipped': 0, 'errors': 0, 'azure_uploaded': 0, 'azure_failed': 0}
         
         # Get all video files from source directory
@@ -319,8 +434,8 @@ class VideoSyncManager:
         
         orphaned_count = 0
         for source_path_str, mapping in list(self.hash_mappings.items()):
-            source_path = Path(source_path_str)
-            if not source_path.exists():
+            source_path = self._normalize_path(source_path_str)
+            if not self._safe_path_exists(source_path):
                 # Build the anonymized file path with folder structure
                 relative_dir = Path(mapping.get('relative_dir', '.'))
                 anonymous_filename = mapping['anonymous_name']
@@ -330,10 +445,13 @@ class VideoSyncManager:
                 else:
                     anonymous_path = self.destination_dir / anonymous_filename
                 
-                if anonymous_path.exists():
-                    anonymous_path.unlink()
-                    logger.info(f"Removed orphaned file: {relative_dir / anonymous_filename}")
-                    orphaned_count += 1
+                if self._safe_path_exists(anonymous_path):
+                    try:
+                        anonymous_path.unlink()
+                        logger.info(f"Removed orphaned file: {relative_dir / anonymous_filename}")
+                        orphaned_count += 1
+                    except (OSError, PermissionError) as e:
+                        logger.error(f"Failed to remove orphaned file {anonymous_path}: {e}")
                 
                 # Remove from mappings
                 del self.hash_mappings[source_path_str]
@@ -555,11 +673,17 @@ def main():
             for source_path_str, mapping in sync_manager.hash_mappings.items():
                 if not mapping.get('azure_uploaded', False):
                     anonymous_filename = mapping.get('anonymous_name')
+                    relative_dir = Path(mapping.get('relative_dir', '.'))
+                    
                     if anonymous_filename:
-                        destination_path = sync_manager.destination_dir / anonymous_filename
-                        if destination_path.exists():
-                            if not sync_manager.is_blob_uploaded(anonymous_filename):
-                                upload_success = sync_manager.upload_to_azure_blob(destination_path, anonymous_filename)
+                        if str(relative_dir) != '.':
+                            destination_path = sync_manager.destination_dir / relative_dir / anonymous_filename
+                        else:
+                            destination_path = sync_manager.destination_dir / anonymous_filename
+                        
+                        if sync_manager._safe_path_exists(destination_path):
+                            if not sync_manager.is_blob_uploaded(anonymous_filename, relative_dir):
+                                upload_success = sync_manager.upload_to_azure_blob(destination_path, anonymous_filename, relative_dir)
                                 if upload_success:
                                     sync_manager.hash_mappings[source_path_str]['azure_uploaded'] = True
                                     sync_manager.hash_mappings[source_path_str]['azure_upload_date'] = datetime.now().isoformat()
@@ -569,6 +693,9 @@ def main():
                             else:
                                 logger.info(f"Blob already exists: {anonymous_filename}")
                                 stats['skipped'] += 1
+                        else:
+                            logger.warning(f"Local file not found: {destination_path}")
+                            stats['azure_failed'] += 1
             
             sync_manager.save_hash_mappings()
             logger.info(f"Azure upload completed. Uploaded: {stats['azure_uploaded']}, "
