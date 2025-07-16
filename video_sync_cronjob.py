@@ -7,6 +7,7 @@ This script performs two main functions:
 """
 
 import os
+import re
 import hashlib
 import shutil
 import logging
@@ -184,9 +185,22 @@ class VideoSyncManager:
         """Generate anonymous filename using hash function"""
         # Extract file extension
         file_ext = Path(original_filename).suffix
-        
-        # Create hash input (filename + salt for additional security)
-        hash_input = f"{original_filename}{self.config['salt']}"
+
+        #extract 6 digit MRD for anonymization
+        # If MRD is present, extract it
+        mrd_match = re.search(r'\b\d{6}\b', original_filename)
+        if mrd_match:
+            mrd = mrd_match.group(0)
+            logger.info(f"Extracted MRD: {mrd} from filename: {original_filename}")
+        else:
+            mrd = None
+            logger.info(f"No MRD found in filename: {original_filename}")
+
+        # If MRD is found, use it else use the original filename
+        if mrd:
+            hash_input = f"{mrd}{self.config['salt']}"
+        else:
+            hash_input = f"{original_filename}{self.config['salt']}"
         
         # Generate hash based on configured algorithm
         hash_algorithm = self.config.get('hash_algorithm', 'sha256')
