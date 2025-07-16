@@ -186,12 +186,12 @@ class VideoSyncManager:
         # Extract file extension
         file_ext = Path(original_filename).suffix
 
-        #extract 6 digit MRD for anonymization
-        # If MRD is present, extract it
-        mrd_match = re.search(r'\b\d{6}\b', original_filename)
-        if mrd_match:
-            mrd = mrd_match.group(0)
-            logger.info(f"Extracted MRD: {mrd} from filename: {original_filename}")
+        # Extract all 6 digit numbers for anonymization
+        mrd_matches = re.findall(r'\b\d{6}\b', original_filename)
+        if mrd_matches and len(mrd_matches) == 1:
+            # Use the first 6-digit number found
+            mrd = mrd_matches[0]
+            logger.info(f"Found {len(mrd_matches)} 6-digit numbers. Using MRD: {mrd} from filename: {original_filename}")
         else:
             mrd = None
             logger.info(f"No MRD found in filename: {original_filename}")
